@@ -26,26 +26,51 @@ def message_to_text(message):
             result.append(line)
         return text
 
-    def decode_qp(text):
-        try:
-            return quopri.decodestring(text.encode('utf-8')).decode('utf-8')
-        except UnicodeDecodeError:
-            return quopri.decodestring(text.encode('utf-8')).decode('latin1')
+    def parse_charset(part):
+        content_type = part.get('Content-Type', '')
+        match = re.search(r'charset=["\']?([^\s;"\']+)', content_type, re.IGNORECASE)
+        return match.group(1) if match else 'utf-8'
+
+    def decode_payload(part):
+        payload = part.get_payload()
+        if payload is None or isinstance(payload, list):
+            return ''
+
+        transfer_encoding = part.get('Content-Transfer-Encoding', '').lower()
+        charset = parse_charset(part)
+
+        if isinstance(payload, bytes):
+            data = payload
+        else:
+            payload_str = str(payload)
+            if transfer_encoding == "base64":
+                try:
+                    data = base64.b64decode(payload_str, validate=False)
+                except Exception:
+                    data = payload_str.encode('utf-8', errors='ignore')
+            elif transfer_encoding == "quoted-printable":
+                data = quopri.decodestring(payload_str)
+            else:
+                return payload_str
+
+        for encoding in (charset, 'utf-8', 'latin1'):
+            try:
+                return data.decode(encoding)
+            except (LookupError, UnicodeDecodeError):
+                continue
+        return data.decode('utf-8', errors='replace')
 
     from_addr = message.get_header('From').strip()
     date_str = fmt_timestamp(message.get_date())
 
     result = [f"FROM: {from_addr}", f"DATE: {date_str}"]
     parts = list(message.get_message_parts())
+    html_parts = []
+    plain_parts = []
 
     for part in parts:
         if part.get_content_type() == "text/html":
-            html = part.get_payload()
-            encoding = part.get('Content-Transfer-Encoding', '').lower()
-            if encoding == "base64":
-                html = base64.b64decode(html).decode("utf-8")
-            elif encoding == "quoted-printable":
-                html = decode_qp(html)
+            html = decode_payload(part)
             h = html2text.HTML2Text()
             h.body_width = 0
             h.emphasis_mark = ""
@@ -53,7 +78,19 @@ def message_to_text(message):
             plain = h.handle(html)
             plain = normalize_empty_lines(plain)
             plain = extract_reply(plain)
-            result.append(plain)
+            if plain:
+                html_parts.append(plain)
+        elif part.get_content_type() == "text/plain":
+            plain = decode_payload(part)
+            plain = normalize_empty_lines(plain)
+            plain = extract_reply(plain)
+            if plain:
+                plain_parts.append(plain)
+
+    if html_parts:
+        result.extend(html_parts)
+    elif plain_parts:
+        result.extend(plain_parts)
 
     return "\n".join(result)
 
